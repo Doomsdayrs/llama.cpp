@@ -5,11 +5,15 @@
 #include <cinttypes>
 #include <fstream>
 #include <random>
+#include <map>
 #include <unordered_map>
 #include <queue>
 #include <regex>
 #include <cassert>
 #include <cstring>
+
+#define LLAMA_USE_SCRATCH
+#define LLAMA_MAX_SCRATCH_BUFFERS 16
 
 // determine number of model parts based on the dimension
 static const std::unordered_map<int, int> LLAMA_N_PARTS = {
@@ -17,6 +21,69 @@ static const std::unordered_map<int, int> LLAMA_N_PARTS = {
     { 5120, 2 },
     { 6656, 4 },
     { 8192, 8 },
+};
+
+// available llama models
+enum e_model {
+    MODEL_UNKNOWN,
+    MODEL_7B,
+    MODEL_13B,
+    MODEL_30B,
+    MODEL_65B,
+};
+
+static const size_t MB = 1024*1024;
+
+// TODO: dynamically determine theses sizes
+//       needs modifications in ggml
+
+static const std::map<e_model, size_t> MEM_REQ_SCRATCH0 = {
+    { MODEL_7B,    12ull*MB },
+    { MODEL_13B,   15ull*MB },
+    { MODEL_30B,   23ull*MB },
+    { MODEL_65B,   31ull*MB },
+};
+
+static const std::map<e_model, size_t> MEM_REQ_SCRATCH1 = {
+    { MODEL_7B,    18ull*MB },
+    { MODEL_13B,   24ull*MB },
+    { MODEL_30B,   36ull*MB },
+    { MODEL_65B,   48ull*MB },
+};
+
+static const std::map<e_model, size_t> MEM_REQ_SCRATCH2 = {
+    { MODEL_7B,     4ull*MB },
+    { MODEL_13B,    4ull*MB },
+    { MODEL_30B,    6ull*MB },
+    { MODEL_65B,    7ull*MB },
+};
+
+static const std::map<e_model, size_t> MEM_REQ_SCRATCH3 = {
+    { MODEL_7B,     4ull*MB },
+    { MODEL_13B,    4ull*MB },
+    { MODEL_30B,    6ull*MB },
+    { MODEL_65B,    7ull*MB },
+};
+
+static const std::map<e_model, size_t> MEM_REQ_MODEL = {
+    { MODEL_7B,    74ull*MB },
+    { MODEL_13B,  142ull*MB },
+    { MODEL_30B,  466ull*MB },
+    { MODEL_65B, 1464ull*MB },
+};
+
+static const std::map<e_model, size_t> MEM_REQ_KV = {
+    { MODEL_7B,     5ull*MB },
+    { MODEL_13B,    6ull*MB },
+    { MODEL_30B,   16ull*MB },
+    { MODEL_65B,   43ull*MB },
+};
+
+static const std::map<e_model, size_t> MEM_REQ_EVAL = {
+    { MODEL_7B,   512ull*MB },
+    { MODEL_13B,  512ull*MB },
+    { MODEL_30B,  512ull*MB },
+    { MODEL_65B,  512ull*MB },
 };
 
 // default hparams (LLaMA 7B)
@@ -51,6 +118,8 @@ struct llama_layer {
 };
 
 struct llama_model {
+    e_model type = MODEL_UNKNOWN;
+
     llama_hparams hparams;
 
     struct ggml_tensor * tok_embeddings;
@@ -60,12 +129,19 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // context
+    struct ggml_context * ctx;
+
     // key + value memory
+    // TODO: move to llama_state
     struct ggml_tensor * memory_k;
     struct ggml_tensor * memory_v;
 
-    //
-    struct ggml_context * ctx;
+    // the model memory buffer
+    std::vector<uint8_t> buf;
+
+    // tensors
+    int n_loaded;
     std::unordered_map<std::string, struct ggml_tensor *> tensors;
 };
 
@@ -105,6 +181,45 @@ struct llama_context {
 
     // input embedding (1-dimensional array: [n_embd])
     std::vector<float> embedding;
+
+    // memory buffers used to evaluate the model
+    // TODO: move in llama_state
+    std::vector<uint8_t> buf_compute;
+    std::vector<uint8_t> buf_scratch[LLAMA_MAX_SCRATCH_BUFFERS];
+
+    int    buf_last = 0;
+    size_t buf_max_size[LLAMA_MAX_SCRATCH_BUFFERS] = { 0 };
+
+    void use_buf(struct ggml_context * ctx, int i) {
+#if defined(LLAMA_USE_SCRATCH)
+        size_t last_size = 0;
+
+        if (i == -1) {
+            last_size = ggml_set_scratch(ctx, { 0, 0, nullptr, });
+        } else {
+            auto & buf = buf_scratch[i];
+            last_size = ggml_set_scratch(ctx, { 0, buf.size(), buf.data(), });
+        }
+
+        if (buf_last >= 0) {
+            buf_max_size[buf_last] = std::max(buf_max_size[buf_last], last_size);
+        }
+
+        buf_last = i;
+#else
+        (void) i;
+        (void) ctx;
+#endif
+    }
+
+    size_t get_buf_max_mem(int i) const {
+#if defined(LLAMA_USE_SCRATCH)
+        return buf_max_size[i];
+#else
+        (void) i;
+        return 0;
+#endif
+    }
 };
 
 struct llama_context_params llama_context_default_params() {
@@ -204,6 +319,22 @@ static bool llama_model_load(
             fprintf(stderr, "%s: use '--n_parts 1' if necessary\n", __func__);
         }
 
+        if (hparams.n_layer == 32) {
+            model.type = e_model::MODEL_7B;
+        }
+
+        if (hparams.n_layer == 40) {
+            model.type = e_model::MODEL_13B;
+        }
+
+        if (hparams.n_layer == 52) {
+            model.type = e_model::MODEL_30B;
+        }
+
+        if (hparams.n_layer == 64) {
+            model.type = e_model::MODEL_65B;
+        }
+
         fprintf(stderr, "%s: n_vocab = %d\n", __func__, hparams.n_vocab);
         fprintf(stderr, "%s: n_ctx   = %d\n", __func__, hparams.n_ctx);
         fprintf(stderr, "%s: n_embd  = %d\n", __func__, hparams.n_embd);
@@ -214,6 +345,28 @@ static bool llama_model_load(
         fprintf(stderr, "%s: f16     = %d\n", __func__, hparams.f16);
         fprintf(stderr, "%s: n_ff    = %d\n", __func__, n_ff);
         fprintf(stderr, "%s: n_parts = %d\n", __func__, n_parts);
+        fprintf(stderr, "%s: type    = %d\n", __func__, model.type);
+
+        // print memory requirements
+        {
+            // this is the total memory required to run the inference
+            const size_t mem_required =
+                     MEM_REQ_SCRATCH0.at(model.type) +
+                     MEM_REQ_SCRATCH1.at(model.type) +
+                     MEM_REQ_SCRATCH2.at(model.type) +
+                     MEM_REQ_SCRATCH3.at(model.type) +
+                     MEM_REQ_MODEL.at   (model.type) +
+                     MEM_REQ_EVAL.at    (model.type);
+
+            // this is the memory required by one llama_state
+            const size_t mem_required_state =
+                     MEM_REQ_KV.at      (model.type);
+
+            fprintf(stderr, "%s: mem required  = %7.2f MB (+ %7.2f MB per state)\n", __func__,
+                    mem_required / 1024.0 / 1024.0, mem_required_state / 1024.0 / 1024.0);
+        }
+
+        lctx.model.buf.resize(MEM_REQ_MODEL.at(model.type));
     }
 
     // load vocab
@@ -416,8 +569,9 @@ static bool llama_model_load(
 
         // load weights
         {
-            int n_tensors = 0;
             size_t total_size = 0;
+
+            model.n_loaded = 0;
 
             fprintf(stderr, "%s: ", __func__);
 
@@ -583,7 +737,10 @@ static bool llama_model_load(
                 }
 
                 //fprintf(stderr, "%42s - [%5d, %5d], type = %6s, %6.2f MB\n", name.data(), ne[0], ne[1], ftype == 0 ? "float" : "f16", ggml_nbytes(tensor)/1024.0/1024.0);
-                if (++n_tensors % 8 == 0) {
+                model.n_loaded++;
+
+                // progress
+                if (model.n_loaded % 8 == 0) {
                     fprintf(stderr, ".");
                     fflush(stderr);
                 }
@@ -591,7 +748,13 @@ static bool llama_model_load(
 
             fprintf(stderr, " done\n");
 
-            fprintf(stderr, "%s: model size = %8.2f MB / num tensors = %d\n", __func__, total_size/1024.0/1024.0, n_tensors);
+            fprintf(stderr, "%s: model size = %8.2f MB / num tensors = %d\n", __func__, total_size/1024.0/1024.0, model.n_loaded);
+            if (model.n_loaded == 0) {
+                fprintf(stderr, "%s: WARN no tensors loaded from model file - assuming empty model for testing\n", __func__);
+            } else if (model.n_loaded != (int) model.tensors.size()) {
+                fprintf(stderr, "%s: ERROR not all tensors loaded from model file - expected %zu, got %d\n", __func__, model.tensors.size(), model.n_loaded);
+                return false;
+            }
         }
 
         fin.close();
@@ -630,27 +793,11 @@ static bool llama_eval_internal(
     const int n_rot   = hparams.n_embd/hparams.n_head;
 
     auto & mem_per_token = lctx.mem_per_token;
-
-    // TODO: fix this hardcoded size
-    static size_t buf_size = 512u*1024*1024;
-    static void * buf = malloc(buf_size);
-
-    if (mem_per_token > 0 && mem_per_token*N > buf_size) {
-        const size_t buf_size_new = 1.3*(mem_per_token*N); // add 30% to account for ggml object overhead
-        //fprintf(stderr, "\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
-
-        // reallocate
-        buf_size = buf_size_new;
-        buf = realloc(buf, buf_size);
-        if (buf == nullptr) {
-            fprintf(stderr, "%s: failed to allocate %zu bytes\n", __func__, buf_size);
-            return false;
-        }
-    }
+    auto & buf_compute   = lctx.buf_compute;
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ buf,
+        /*.mem_size   =*/ buf_compute.size(),
+        /*.mem_buffer =*/ buf_compute.data(),
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -854,7 +1001,13 @@ static bool llama_eval_internal(
     if (mem_per_token == 0) {
         mem_per_token = ggml_used_mem(ctx0)/N;
     }
-    //fprintf(stderr, "used_mem = %zu\n", ggml_used_mem(ctx0));
+
+    printf("\n\n%s: used_mem = %f MB, %f MB, %f MB %f MB %f MB\n", __func__,
+            ggml_used_mem(ctx0)/1024.0/1024.0,
+            lctx.get_buf_max_mem(0)/1024.0/1024.0,
+            lctx.get_buf_max_mem(1)/1024.0/1024.0,
+            lctx.get_buf_max_mem(2)/1024.0/1024.0,
+            lctx.get_buf_max_mem(3)/1024.0/1024.0);
 
     ggml_free(ctx0);
 
@@ -1458,6 +1611,13 @@ struct llama_context * llama_init_from_file(
         if (params.embedding){
             ctx->embedding.reserve(hparams.n_embd);
         }
+
+        ctx->buf_compute.resize(MEM_REQ_EVAL.at(ctx->model.type));
+
+        ctx->buf_scratch[0].resize(MEM_REQ_SCRATCH0.at(ctx->model.type));
+        ctx->buf_scratch[1].resize(MEM_REQ_SCRATCH1.at(ctx->model.type));
+        ctx->buf_scratch[2].resize(MEM_REQ_SCRATCH2.at(ctx->model.type));
+        ctx->buf_scratch[3].resize(MEM_REQ_SCRATCH3.at(ctx->model.type));
     }
 
     return ctx;
